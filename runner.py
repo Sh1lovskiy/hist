@@ -31,11 +31,21 @@ from data_wrappers import (
 from encoders import EncoderConfig, build_encoder
 from explain import save_attention_weights
 from features import FeatureExtractor
-from metrics_ext import compute_metrics, confusion_matrix_png
+from metrics_ext import (
+    ClassificationReport,
+    FoldSummary,
+    compute_classification_report,
+    summarize_class_distribution,
+)
 from models_mil import ABMIL, HierMIL, TransMIL
 from models_gnn import GATHead, GCNHead
 from graphs import GraphBuilder, GraphConfig
-from plotting import plot_losses, plot_metrics
+from plotting import (
+    plot_confusion_matrix,
+    plot_losses,
+    plot_metrics,
+    plot_multi_class_curves,
+)
 from stain import build_transforms
 from tiler import PatchRecord, Tiler
 from wsi_reader import WSIReader
@@ -277,10 +287,10 @@ class CrossValRunner:
 
         for slide_path in slides:
             csv_path = self.cfg.data.csv_dir / f"{slide_path.stem}.csv"
-            if csv_path.exists():
-                logger.debug(f"CSV already exists for {slide_path.stem}")
+            if csv_path.exists() and not getattr(self.cfg, "overwrite", False):
+                logger.debug("CSV already exists for {}", slide_path.stem)
                 continue
-            ann = annotations.get(slide_path.stem, [])  # <— по stem
+            ann = annotations.get(slide_path.stem, [])
             patches = self.tiler.tile_slide(slide_path, ann)
             self._write_csv(csv_path, patches)
 
@@ -391,7 +401,7 @@ class CrossValRunner:
         labels = np.array([bag.label for bag in bags])
         splitter = self._choose_splitter(labels)
         n_classes = max(len(class_map), int(labels.max()) + 1)
-        summary_rows: List[Dict[str, object]] = []
+        fold_summary = FoldSummary()
         for fold, (train_idx, val_idx) in enumerate(
             splitter.split(np.zeros(len(labels)), labels)
         ):
@@ -426,7 +436,7 @@ class CrossValRunner:
                 shuffle=False,
                 collate_fn=lambda x: x[0],
             )
-            history = self._fit_fold(
+            result = self._fit_fold(
                 trainer,
                 train_loader,
                 val_loader,
@@ -434,8 +444,13 @@ class CrossValRunner:
                 class_map,
                 bag_dict,
             )
-            summary_rows.append(history)
-        self._write_summary(summary_rows)
+            fold_summary.add_fold(fold, result["report"], {"config": result["config"]})
+        summary_path = self.cfg.output / "summary.csv"
+        fold_summary.export(summary_path)
+        dist_df = summarize_class_distribution(fold_summary.fold_metrics)
+        dist_path = self.cfg.output / "class_distribution.csv"
+        dist_df.to_csv(dist_path, index=False)
+        logger.info("Saved class distribution summary to {}", dist_path)
 
     def _run_graph_cv(
         self, bag_dict: Dict[str, Bag], class_map: Dict[str, int]
@@ -451,7 +466,7 @@ class CrossValRunner:
         labels = np.array([data.y.item() for _, data in items])
         splitter = self._choose_splitter(labels)
         n_classes = max(len(class_map), int(labels.max()) + 1)
-        summary_rows: List[Dict[str, object]] = []
+        fold_summary = FoldSummary()
         for fold, (train_idx, val_idx) in enumerate(
             splitter.split(np.zeros(len(labels)), labels)
         ):
@@ -476,11 +491,16 @@ class CrossValRunner:
             )
             train_loader = GeoDataLoader(train_graphs, batch_size=4, shuffle=True)
             val_loader = GeoDataLoader(val_graphs, batch_size=4, shuffle=False)
-            history = self._fit_graph_fold(
+            result = self._fit_graph_fold(
                 trainer, train_loader, val_loader, fold, class_map
             )
-            summary_rows.append(history)
-        self._write_summary(summary_rows)
+            fold_summary.add_fold(fold, result["report"], {"config": result["config"]})
+        summary_path = self.cfg.output / "summary.csv"
+        fold_summary.export(summary_path)
+        dist_df = summarize_class_distribution(fold_summary.fold_metrics)
+        dist_path = self.cfg.output / "class_distribution.csv"
+        dist_df.to_csv(dist_path, index=False)
+        logger.info("Saved class distribution summary to {}", dist_path)
 
     def _fit_fold(
         self,
@@ -492,58 +512,97 @@ class CrossValRunner:
         bag_lookup: Dict[str, Bag],
     ) -> Dict[str, object]:
         losses = {"train": [], "val": []}
-        metrics_history = {"f1_macro": [], "balanced_accuracy": [], "roc_auc": []}
+        metric_keys = [
+            "f1_macro",
+            "f1_micro",
+            "f1_weighted",
+            "precision_macro",
+            "precision_micro",
+            "recall_macro",
+            "recall_micro",
+            "balanced_accuracy",
+            "roc_auc_macro",
+            "pr_auc_macro",
+            "mcc",
+            "cohen_kappa",
+            "log_loss",
+        ]
+        metrics_history = {name: [] for name in metric_keys}
         best_f1 = -1.0
         best_attn: Dict[str, Dict[int, torch.Tensor]] = {}
         best_preds: List[int] = []
         best_targets: List[int] = []
+        best_report: ClassificationReport | None = None
+        last_val_out: EpochOutputs | None = None
         for epoch in range(1, self.cfg.trainer.epochs + 1):
             train_out = trainer.train_epoch(train_loader)
             val_out = trainer.eval_epoch(val_loader)
+            last_val_out = val_out
             losses["train"].append(train_out.loss)
             losses["val"].append(val_out.loss)
             y_true = np.array(val_out.targets)
             y_pred = np.array(val_out.preds)
             y_prob = np.vstack(val_out.probs) if val_out.probs else None
-            metric = compute_metrics(
-                y_true, y_pred, y_prob, list(range(len(class_map)))
-            )
-            metrics_history["f1_macro"].append(metric.f1_macro)
-            metrics_history["balanced_accuracy"].append(metric.balanced_accuracy)
-            roc = metric.roc_auc if metric.roc_auc is not None else np.nan
-            metrics_history["roc_auc"].append(roc)
+            class_ids = list(range(len(class_map)))  # полный список!
+            report = compute_classification_report(y_true, y_pred, y_prob, class_ids)
+            for name in metric_keys:
+                metrics_history[name].append(report.metrics.get(name, np.nan))
             logger.info(
-                f"Fold {fold} Epoch {epoch} | "
-                f"train_loss={train_out.loss:.4f} val_loss={val_out.loss:.4f} "
-                f"f1_macro={metric.f1_macro:.4f}"
+                "Fold {} Epoch {} | train_loss={:.4f} val_loss={:.4f} f1_macro={:.4f} bal_acc={:.4f} mcc={:.4f}",
+                fold,
+                epoch,
+                train_out.loss,
+                val_out.loss,
+                report.metrics.get("f1_macro", float("nan")),
+                report.metrics.get("balanced_accuracy", float("nan")),
+                report.metrics.get("mcc", float("nan")),
             )
-            if metric.f1_macro > best_f1:
-                best_f1 = metric.f1_macro
+            if report.metrics.get("f1_macro", -1.0) > best_f1:
+                best_f1 = float(report.metrics.get("f1_macro", -1.0))
                 best_attn = val_out.attentions
                 best_preds = y_pred.tolist()
                 best_targets = y_true.tolist()
+                best_report = report
         fold_dir = self.cfg.output / f"fold_{fold}"
         plot_losses(losses, fold_dir / "loss.png")
         plot_metrics(metrics_history, fold_dir / "metrics.png")
         labels = sorted(class_map.keys(), key=lambda k: class_map[k])
+
         confusion_matrix_png(
             np.array(best_targets),
             np.array(best_preds),
-            labels,
+            labels,  # полный набор имён классов
             fold_dir / "confusion.png",
         )
+        if best_report is None and last_val_out is not None:
+            best_report = compute_classification_report(
+                np.array(last_val_out.targets),
+                np.array(last_val_out.preds),
+                np.vstack(last_val_out.probs) if last_val_out.probs else None,
+                list(range(len(class_map))),
+            )
+        plot_confusion_matrix(best_report.confusion, labels, fold_dir / "confusion.png")
+        if best_report.roc:
+            plot_multi_class_curves(
+                {k: v.to_dict() for k, v in best_report.roc.items()},
+                fold_dir / "roc_auc.png",
+                curve_type="roc",
+                title=f"Fold {fold} ROC-AUC",
+            )
+        if best_report.pr:
+            plot_multi_class_curves(
+                {k: v.to_dict() for k, v in best_report.pr.items()},
+                fold_dir / "pr_auc.png",
+                curve_type="pr",
+                title=f"Fold {fold} PR-AUC",
+            )
         for slide_id, attn in best_attn.items():
             bag = bag_lookup[slide_id]
             save_attention_weights(attn, bag, fold_dir / f"attention_{slide_id}.csv")
         return {
             "fold": fold,
-            "f1_macro": best_f1,
-            "balanced_accuracy": float(np.mean(metrics_history["balanced_accuracy"])),
-            "roc_auc": float(
-                np.mean([m for m in metrics_history["roc_auc"] if m is not None])
-                if any(m is not None for m in metrics_history["roc_auc"])
-                else np.nan
-            ),
+            "report": best_report,
+            "history": metrics_history,
             "config": f"{self.cfg.model}_{self.cfg.encoder}_{self.cfg.augmentation}",
         }
 
@@ -556,7 +615,22 @@ class CrossValRunner:
         class_map: Dict[str, int],
     ) -> Dict[str, object]:
         losses = {"train": [], "val": []}
-        metrics_history = {"f1_macro": [], "balanced_accuracy": [], "roc_auc": []}
+        metric_keys = [
+            "f1_macro",
+            "f1_micro",
+            "precision_macro",
+            "precision_micro",
+            "recall_macro",
+            "recall_micro",
+            "balanced_accuracy",
+            "roc_auc_macro",
+            "pr_auc_macro",
+            "mcc",
+            "cohen_kappa",
+            "log_loss",
+        ]
+        metrics_history = {name: [] for name in metric_keys}
+        best_report: ClassificationReport | None = None
         for epoch in range(1, self.cfg.trainer.epochs + 1):
             train_out = trainer.train_epoch(train_loader)
             val_out = trainer.eval_epoch(val_loader)
@@ -565,37 +639,51 @@ class CrossValRunner:
             y_true = np.array(val_out.targets)
             y_pred = np.array(val_out.preds)
             y_prob = np.vstack(val_out.probs) if val_out.probs else None
-            metric = compute_metrics(
+            report = compute_classification_report(
                 y_true, y_pred, y_prob, list(range(len(class_map)))
             )
-            metrics_history["f1_macro"].append(metric.f1_macro)
-            metrics_history["balanced_accuracy"].append(metric.balanced_accuracy)
-            roc = metric.roc_auc if metric.roc_auc is not None else np.nan
-            metrics_history["roc_auc"].append(roc)
+            for name in metric_keys:
+                metrics_history[name].append(report.metrics.get(name, np.nan))
             logger.info(
-                f"Fold {fold} Epoch {epoch} | "
-                f"train_loss={train_out.loss:.4f} val_loss={val_out.loss:.4f} "
-                f"f1_macro={metric.f1_macro:.4f}"
+                "Graph Fold {} Epoch {} | train_loss={:.4f} val_loss={:.4f} f1_macro={:.4f} bal_acc={:.4f}",
+                fold,
+                epoch,
+                train_out.loss,
+                val_out.loss,
+                report.metrics.get("f1_macro", float("nan")),
+                report.metrics.get("balanced_accuracy", float("nan")),
             )
+            best_report = report
         fold_dir = self.cfg.output / f"fold_{fold}"
         plot_losses(losses, fold_dir / "loss.png")
         plot_metrics(metrics_history, fold_dir / "metrics.png")
         labels = sorted(class_map.keys(), key=lambda k: class_map[k])
-        confusion_matrix_png(
-            np.array(val_out.targets),
-            np.array(val_out.preds),
-            labels,
-            fold_dir / "confusion.png",
-        )
+        if best_report is None:
+            best_report = compute_classification_report(
+                np.array(val_out.targets),
+                np.array(val_out.preds),
+                np.vstack(val_out.probs) if val_out.probs else None,
+                list(range(len(class_map))),
+            )
+        plot_confusion_matrix(best_report.confusion, labels, fold_dir / "confusion.png")
+        if best_report.roc:
+            plot_multi_class_curves(
+                {k: v.to_dict() for k, v in best_report.roc.items()},
+                fold_dir / "roc_auc.png",
+                curve_type="roc",
+                title=f"Fold {fold} ROC-AUC",
+            )
+        if best_report.pr:
+            plot_multi_class_curves(
+                {k: v.to_dict() for k, v in best_report.pr.items()},
+                fold_dir / "pr_auc.png",
+                curve_type="pr",
+                title=f"Fold {fold} PR-AUC",
+            )
         return {
             "fold": fold,
-            "f1_macro": float(np.mean(metrics_history["f1_macro"])),
-            "balanced_accuracy": float(np.mean(metrics_history["balanced_accuracy"])),
-            "roc_auc": float(
-                np.mean([m for m in metrics_history["roc_auc"] if m is not None])
-                if any(m is not None for m in metrics_history["roc_auc"])
-                else np.nan
-            ),
+            "report": best_report,
+            "history": metrics_history,
             "config": f"{self.cfg.model}_{self.cfg.encoder}_{self.cfg.augmentation}",
         }
 
@@ -608,15 +696,6 @@ class CrossValRunner:
                 continue
             graphs[slide_id] = builder.build(bag, primary_mag)
         return graphs
-
-    def _write_summary(self, rows: List[Dict[str, object]]) -> None:
-        out_path = self.cfg.output / "summary.csv"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        logger.info(f"Saved summary metrics to {out_path}")
 
     def _choose_splitter(self, labels: np.ndarray):
         from sklearn.model_selection import KFold, StratifiedKFold
@@ -639,6 +718,9 @@ def _build_runner_parser() -> argparse.ArgumentParser:
     parser.add_argument("--levels", type=int, nargs="+")
     parser.add_argument("--patch-size", type=int, default=256)
     parser.add_argument("--stride", type=int)
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing per-slide CSVs."
+    )
     return parser
 
 

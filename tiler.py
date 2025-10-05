@@ -1,21 +1,22 @@
-"""Slide tiling utilities producing patch metadata across magnifications."""
+# tiler.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from loguru import logger
 from matplotlib.path import Path as MplPath
+from openslide import OpenSlide
 
-from annotations import SlideAnnotation
+from annotations import PolygonAnn
 from wsi_reader import WSIReader
 
 
 @dataclass
 class PatchRecord:
-    """Description of a patch in a slide."""
+    """Patch metadata row used to write CSV."""
 
     slide_id: str
     slide_path: Path
@@ -26,102 +27,70 @@ class PatchRecord:
     label: str
 
 
+def _build_polygon_paths(polys: List[PolygonAnn]) -> List[Tuple[str, MplPath]]:
+    """Convert polygons to (label, MplPath)."""
+    paths: List[Tuple[str, MplPath]] = []
+    for p in polys:
+        pts = np.asarray(p.points, dtype=float)
+        if pts.shape[0] >= 3:
+            paths.append((p.label, MplPath(pts)))
+    return paths
+
+
+def _label_by_center(x: int, y: int, ps: int, paths: List[Tuple[str, MplPath]]) -> str:
+    """Assign label if patch center lies inside any polygon, else 'background'."""
+    cx, cy = x + ps * 0.5, y + ps * 0.5
+    for lab, path in paths:
+        if path.contains_points([[cx, cy]])[0]:
+            return lab
+    return "background"
+
+
 class Tiler:
-    """Tile whole-slide images into patches."""
+    """Grid tiler at level-0; labels by center-in-polygon rule."""
 
-    def __init__(
-        self,
-        reader: WSIReader,
-        patch_size: int = 256,
-        stride: int | None = None,
-        magnifications: Iterable[int] = (40, 10),
-    ) -> None:
+    def __init__(self, reader: WSIReader, patch_size: int, magnifications):
         self.reader = reader
-        self.patch_size = patch_size
-        self.stride = stride or patch_size
+        self.patch_size = int(patch_size)
         self.magnifications = list(magnifications)
+        self.level = 0
+        self.default_mag = max(self.magnifications) if self.magnifications else 40
 
-    def tile_slide(self, slide_path: Path, annotation: SlideAnnotation | None) -> List[PatchRecord]:
-        """Tile a slide and return patch metadata."""
-        info = self.reader.info(slide_path)
-        if info.objective_power is None:
-            logger.warning(f"Missing magnification metadata for {slide_path}")
-        base_mag = info.objective_power or self.magnifications[0]
-        patches: List[PatchRecord] = []
-        poly_paths = _build_polygon_paths(annotation)
-        for mag in self.magnifications:
-            level = _closest_level(info.level_downsamples, base_mag, mag)
-            patches.extend(self._tile_level(slide_path, annotation, poly_paths, level, mag))
-        return patches
+    def _level0_dims(self, slide_path: Path) -> tuple[int, int]:
+        with OpenSlide(str(slide_path)) as s:
+            w, h = s.level_dimensions[self.level]
+        return int(w), int(h)
 
-    def _tile_level(
-        self,
-        slide_path: Path,
-        annotation: SlideAnnotation | None,
-        poly_paths: Dict[str, List[MplPath]],
-        level: int,
-        magnification: int,
+    def tile_slide(
+        self, slide_path: Path, polys: List[PolygonAnn]
     ) -> List[PatchRecord]:
-        """Tile a single pyramid level."""
-        info = self.reader.info(slide_path)
-        downsample = info.level_downsamples[level]
-        width, height = np.array(info.dimensions) / downsample
-        width = int(width)
-        height = int(height)
-        patches: List[PatchRecord] = []
-        for y in range(0, height - self.patch_size + 1, self.stride):
-            for x in range(0, width - self.patch_size + 1, self.stride):
-                label = self._patch_label(
-                    annotation,
-                    poly_paths,
-                    (x + self.patch_size // 2, y + self.patch_size // 2),
-                    downsample,
-                )
-                patches.append(
+        """Tile slide into patches and assign labels."""
+        slide_id = slide_path.stem
+        w, h = self._level0_dims(slide_path)
+        ps = self.patch_size
+        stride = ps
+        paths = _build_polygon_paths(polys)
+
+        rows: List[PatchRecord] = []
+        for y in range(0, max(0, h - ps + 1), stride):
+            for x in range(0, max(0, w - ps + 1), stride):
+                lab = _label_by_center(x, y, ps, paths)
+                rows.append(
                     PatchRecord(
-                        slide_id=slide_path.stem,
+                        slide_id=slide_id,
                         slide_path=slide_path,
-                        magnification=magnification,
-                        level=level,
-                        x=int(x * downsample),
-                        y=int(y * downsample),
-                        label=label,
+                        magnification=self.default_mag,
+                        level=self.level,
+                        x=x,
+                        y=y,
+                        label=lab,
                     )
                 )
-        logger.debug(
-            f"Generated {len(patches)} patches for {slide_path.stem} at {magnification}x"
+        logger.info(
+            "Tiled {}: {} patches (ps={}, stride={})",
+            slide_id,
+            len(rows),
+            ps,
+            stride,
         )
-        return patches
-
-    def _patch_label(
-        self,
-        annotation: SlideAnnotation | None,
-        poly_paths: Dict[str, List[MplPath]],
-        center_lvl: Tuple[int, int],
-        downsample: float,
-    ) -> str:
-        """Assign label by checking if the patch center is within any polygon."""
-        if annotation is None:
-            return "background"
-        center_base = (center_lvl[0] * downsample, center_lvl[1] * downsample)
-        for label, paths in poly_paths.items():
-            for path in paths:
-                if path.contains_point(center_base):
-                    return label
-        return "background"
-
-
-def _build_polygon_paths(annotation: SlideAnnotation | None) -> Dict[str, List[MplPath]]:
-    if annotation is None:
-        return {}
-    mapping: Dict[str, List[MplPath]] = {}
-    for poly in annotation.polygons:
-        mapping.setdefault(poly.label, []).append(MplPath(poly.vertices))
-    return mapping
-
-
-def _closest_level(downsamples: Tuple[float, ...], base_mag: float, target_mag: int) -> int:
-    """Select the pyramid level that matches the target magnification."""
-    mags = base_mag / np.array(downsamples)
-    idx = int(np.abs(mags - target_mag).argmin())
-    return idx
+        return rows

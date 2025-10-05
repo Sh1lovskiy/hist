@@ -7,7 +7,7 @@ from typing import List
 import argparse
 
 AUG_CHOICES = ("none", "basic", "strong")
-MODEL_CHOICES = ("abmil", "hiermil", "transmil", "gcn", "gat")
+MODEL_CHOICES = ("abmil", "hiermil", "transmil", "gcn", "gat", "all")
 ENCODER_CHOICES = (
     "resnet18",
     "resnet50",
@@ -85,7 +85,55 @@ def _default_trainer(device: str) -> TrainerConfig:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser("train_mil_cv")
+    """Build the cross-validation training argument parser.
+
+    The parser advertises concrete end-to-end examples so that invoking
+    ``python -m train_mil_cv --help`` provides an immediate cheatsheet for the
+    complete research pipeline.
+    """
+
+    usage_examples = """\
+Examples:
+  # 1️⃣ Generate patch metadata from WSIs and annotations
+  python -m runner \
+    --slides data/wss1_v2/out/train/slides \
+    --annos  data/wss1_v2/anno \
+    --out    data/wss1_v2/out/train \
+    --levels 0 1 2 \
+    --patch-size 224 \
+    --stride 224
+
+  # 2️⃣ Train Hierarchical MIL (ViT backbone) with CV
+  python -m train_mil_cv \
+    --data-root data/wss1_v2/out/train \
+    --output runs/hiermil_vit224 \
+    --model hiermil --encoder vit_b16 \
+    --aug strong --stain --epochs 20 --k-folds 5 --device cuda \
+    --patch-size 224
+
+  # 3️⃣ Compare GCN vs GAT vs TransMIL vs ABMIL vs HierMIL
+  python -m train_mil_cv \
+    --data-root data/wss1_v2/out/train \
+    --output runs/compare_models \
+    --model all --encoder vit_b16 --aug strong --epochs 20 \
+    --k-folds 5 --device cuda
+
+  # 4️⃣ Visualize attention & embeddings
+  python -m explain \
+    --features runs/hiermil_vit224/features.npy \
+    --attn runs/hiermil_vit224/attn/ \
+    --out runs/hiermil_vit224/tsne/
+"""
+
+    parser = argparse.ArgumentParser(
+        "train_mil_cv",
+        description=(
+            "Cross-validated weakly supervised MIL / Hierarchical MIL training "
+            "for whole-slide histopathology."
+        ),
+        epilog=usage_examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("runs/latest"))
     parser.add_argument("--model", choices=MODEL_CHOICES, default="hiermil")

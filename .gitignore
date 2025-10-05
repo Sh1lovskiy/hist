@@ -26,6 +26,7 @@ logs/
 checkpoints/
 runs/
 experiments/
+debug_patches/
 
 # Images / figures
 *.png
