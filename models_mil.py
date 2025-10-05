@@ -1,72 +1,115 @@
+"""MIL models: ABMIL, TransMIL, Hierarchical MIL."""
 from __future__ import annotations
+
+from typing import Dict, Tuple
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, List, Tuple
+from torch import nn
 
 
 class ABMIL(nn.Module):
-    """Attention-MIL head."""
+    """Attention-based MIL model."""
 
-    def __init__(self, d: int, n_cls: int):
+    def __init__(self, in_dim: int, n_classes: int, hidden_dim: int = 256) -> None:
         super().__init__()
-        self.att = nn.Sequential(nn.Linear(d, 128), nn.Tanh(), nn.Linear(128, 1))
-        self.cls = nn.Linear(d, n_cls)
+        self.feature = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.classifier = nn.Linear(hidden_dim, n_classes)
 
-    def forward(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        a = self.att(H).squeeze(-1)
-        w = torch.softmax(a, dim=0).unsqueeze(-1)
-        z = torch.sum(w * H, dim=0, keepdim=True)
-        logits = self.cls(z)
-        return logits, w.squeeze(-1)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feats = self.feature(x)
+        att = self.attention(feats)
+        weights = torch.softmax(att.transpose(0, 1), dim=1)
+        emb = torch.mm(weights, feats)
+        logits = self.classifier(emb)
+        return logits, weights.squeeze(0)
 
 
-class LevelGate(nn.Module):
-    """Gating for level-wise fusion."""
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional embedding."""
 
-    def __init__(self, d: int):
+    def __init__(self, dim: int, max_len: int = 5000) -> None:
         super().__init__()
-        self.g = nn.Sequential(nn.Linear(d, d), nn.Tanh(), nn.Linear(d, 1))
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2) * (-torch.log(torch.tensor(10000.0)) / dim)
+        )
+        pe = torch.zeros(max_len, dim)
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
 
-    def forward(self, Z: torch.Tensor) -> torch.Tensor:
-        # Z: [L, d]
-        a = torch.softmax(self.g(Z).squeeze(-1), dim=0)  # [L]
-        z = torch.sum(a.unsqueeze(-1) * Z, dim=0, keepdim=True)
-        return z  # [1, d]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1)]
+
+
+class TransMIL(nn.Module):
+    """Transformer-based MIL model."""
+
+    def __init__(self, in_dim: int, n_classes: int, depth: int = 2, heads: int = 4) -> None:
+        super().__init__()
+        self.input_proj = nn.Linear(in_dim, in_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=in_dim, nhead=heads, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.pos_encoding = PositionalEncoding(in_dim)
+        self.att_linear = nn.Linear(in_dim, 1)
+        self.classifier = nn.Linear(in_dim, n_classes)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        proj = self.input_proj(x).unsqueeze(0)
+        h = self.pos_encoding(proj)
+        h = self.transformer(h)
+        att = torch.softmax(self.att_linear(h).squeeze(0).squeeze(-1), dim=0)
+        pooled = torch.matmul(att.unsqueeze(0), h.squeeze(0)).squeeze(0)
+        logits = self.classifier(pooled)
+        return logits.unsqueeze(0), att
 
 
 class HierMIL(nn.Module):
-    """
-    Hierarchical MIL: attention pooling inside each level,
-    gated fusion across levels, then classifier.
-    """
+    """Hierarchical MIL combining multiple magnifications."""
 
-    def __init__(self, d: int, n_cls: int):
+    def __init__(
+        self,
+        in_dim: int,
+        n_classes: int,
+        magnifications: Tuple[int, ...] = (40, 10),
+    ) -> None:
         super().__init__()
-        self.att = nn.ModuleDict(
-            {
-                "L0": nn.Sequential(nn.Linear(d, 128), nn.Tanh(), nn.Linear(128, 1)),
-                "L1": nn.Sequential(nn.Linear(d, 128), nn.Tanh(), nn.Linear(128, 1)),
-                "L2": nn.Sequential(nn.Linear(d, 128), nn.Tanh(), nn.Linear(128, 1)),
-            }
+        self.magnifications = magnifications
+        self.level_attention = nn.ModuleDict(
+            {str(mag): nn.Sequential(nn.Linear(in_dim, in_dim), nn.Tanh(), nn.Linear(in_dim, 1)) for mag in magnifications}
         )
-        self.gate = LevelGate(d)
-        self.cls = nn.Linear(d, n_cls)
+        self.level_proj = nn.ModuleDict(
+            {str(mag): nn.Linear(in_dim, in_dim) for mag in magnifications}
+        )
+        self.global_att = nn.Sequential(nn.Linear(in_dim, in_dim), nn.Tanh(), nn.Linear(in_dim, 1))
+        self.classifier = nn.Linear(in_dim, n_classes)
 
-    def _pool_level(self, H: torch.Tensor, level: str) -> torch.Tensor:
-        a = self.att[level](H).squeeze(-1)
-        w = torch.softmax(a, dim=0).unsqueeze(-1)
-        z = torch.sum(w * H, dim=0, keepdim=True)
-        return z  # [1, d]
-
-    def forward(self, bags_by_level: Dict[str, torch.Tensor]) -> torch.Tensor:
-        Z = []
-        for L in ("L0", "L1", "L2"):
-            if L in bags_by_level and bags_by_level[L].size(0) > 0:
-                Z.append(self._pool_level(bags_by_level[L], L))
-        if not Z:
-            raise ValueError("No levels provided to HierMIL.")
-        Z = torch.cat(Z, dim=0)  # [L, d]
-        zf = self.gate(Z)  # [1, d]
-        logits = self.cls(zf)  # [1, n_cls]
-        return logits
+    def forward(self, bags: Dict[int, torch.Tensor]) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        embeddings = []
+        att_weights: Dict[int, torch.Tensor] = {}
+        for mag in self.magnifications:
+            if mag not in bags:
+                continue
+            feats = bags[mag]
+            att = self.level_attention[str(mag)](feats)
+            weights = torch.softmax(att.transpose(0, 1), dim=1)
+            pooled = torch.mm(weights, self.level_proj[str(mag)](feats))
+            embeddings.append(pooled)
+            att_weights[mag] = weights.squeeze(0)
+        if not embeddings:
+            raise ValueError("No magnification features available for HierMIL")
+        stacked = torch.cat(embeddings, dim=0)
+        global_att = torch.softmax(self.global_att(stacked).transpose(0, 1), dim=1)
+        slide_emb = torch.mm(global_att, stacked)
+        logits = self.classifier(slide_emb)
+        return logits, att_weights

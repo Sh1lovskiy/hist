@@ -1,51 +1,88 @@
-# wsi_reader.py
+"""WSI reader built on top of OpenSlide with metadata helpers."""
 from __future__ import annotations
-from typing import Tuple
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
 from loguru import logger
-import openslide
+
+try:
+    import openslide
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise RuntimeError("OpenSlide must be installed for WSI reading") from exc
 
 
-def open_wsi(path: str) -> openslide.OpenSlide:
-    """Open a WSI via OpenSlide."""
-    slide = openslide.OpenSlide(path)
-    return slide
+@dataclass
+class SlideInfo:
+    """Metadata describing a whole-slide image."""
+
+    path: Path
+    dimensions: Tuple[int, int]
+    levels: int
+    level_downsamples: Tuple[float, ...]
+    objective_power: float | None
 
 
-def get_level_dims(slide: openslide.OpenSlide) -> Tuple[Tuple[int, int], ...]:
-    """Return level dimensions for all pyramid levels."""
-    return slide.level_dimensions
+class WSIReader:
+    """Thin wrapper over OpenSlide supporting caching and magnification queries."""
+
+    def __init__(self) -> None:
+        self._cache: Dict[Path, openslide.OpenSlide] = {}
+
+    def open(self, path: Path) -> openslide.OpenSlide:
+        """Open a slide and cache the handle."""
+        if path not in self._cache:
+            logger.debug(f"Opening slide {path}")
+            self._cache[path] = openslide.OpenSlide(str(path))
+        return self._cache[path]
+
+    def info(self, path: Path) -> SlideInfo:
+        """Return metadata for a slide."""
+        slide = self.open(path)
+        dims = slide.dimensions
+        downsamples = tuple(float(v) for v in slide.level_downsamples)
+        power = _objective_power(slide)
+        return SlideInfo(
+            path=path,
+            dimensions=dims,
+            levels=len(downsamples),
+            level_downsamples=downsamples,
+            objective_power=power,
+        )
+
+    def read_region(
+        self,
+        path: Path,
+        location: Tuple[int, int],
+        level: int,
+        size: Tuple[int, int],
+    ) -> np.ndarray:
+        """Read a region as a numpy array."""
+        slide = self.open(path)
+        img = slide.read_region(location, level, size)
+        arr = np.asarray(img.convert("RGB"))
+        return arr
+
+    def close(self) -> None:
+        """Close all cached slides."""
+        for slide in self._cache.values():
+            slide.close()
+        self._cache.clear()
 
 
-def get_level_downsamples(slide: openslide.OpenSlide) -> Tuple[float, ...]:
-    """Return level downsample factors (relative to level 0)."""
-    return slide.level_downsamples
-
-
-def get_mpp_mag(slide: openslide.OpenSlide) -> Tuple[float, float, float]:
-    """
-    Return (mpp_x, mpp_y, nominal_mag) when available.
-    """
-    props = slide.properties
-    mpp_x = float(props.get("openslide.mpp-x", 0) or 0)
-    mpp_y = float(props.get("openslide.mpp-y", 0) or 0)
-    mag = float(props.get("openslide.objective-power", 0) or 0)
-    logger.info(f"MPP x={mpp_x}, y={mpp_y}, nominal mag={mag}")
-    return mpp_x, mpp_y, mag
-
-
-def read_region_rgb(
-    slide: openslide.OpenSlide,
-    level: int,
-    x: int,
-    y: int,
-    w: int,
-    h: int,
-):
-    """
-    Read an RGB patch at a pyramid level.
-    Coordinates (x,y) are at that level's coordinate system.
-    """
-    ds = slide.level_downsamples[level]
-    loc = (int(x * ds), int(y * ds))
-    img = slide.read_region(loc, level, (w, h)).convert("RGB")
-    return img
+def _objective_power(slide: openslide.OpenSlide) -> float | None:
+    """Extract objective power if metadata is present."""
+    keys = [
+        "aperio.AppMag",
+        "openslide.mpp-x",
+        "tiff.XResolution",
+    ]
+    for key in keys:
+        if key in slide.properties:
+            try:
+                return float(slide.properties[key])
+            except ValueError:  # pragma: no cover - metadata issues
+                continue
+    return None

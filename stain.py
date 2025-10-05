@@ -1,58 +1,73 @@
-# stain.py
+"""Augmentation and stain normalization utilities."""
 from __future__ import annotations
+
 from typing import Tuple
+
 import numpy as np
-import cv2
+from torchvision import transforms
 
 
-def _optical_density(img_rgb: np.ndarray) -> np.ndarray:
-    img = np.clip(img_rgb.astype(np.float32), 1.0, 255.0)
-    return -np.log(img / 255.0 + 1e-6)
-
-
-def _top_eigvecs(A: np.ndarray, k: int = 2) -> np.ndarray:
-    cov = np.cov(A, rowvar=False)
-    w, v = np.linalg.eigh(cov)
-    idx = np.argsort(w)[::-1][:k]
-    return v[:, idx]
-
-
-def macenko_normalize(
-    img_rgb: np.ndarray,
-    ref_he: Tuple[np.ndarray, np.ndarray] | None = None,
-    Io: float = 255.0,
-    alpha: float = 0.1,
-) -> np.ndarray:
-    """
-    Macenko stain normalization. Returns uint8 RGB.
-    Keep <55 lines, minimal numpy/OPENCV implementation.
-    """
-    OD = _optical_density(img_rgb)
-    OD = OD.reshape(-1, 3)
-    OD = OD[~np.any(OD < 0.15, axis=1)]
-    if OD.size == 0:
-        return img_rgb
-
-    V = _top_eigvecs(OD, k=2)
-    proj = OD @ V
-    phi = np.arctan2(proj[:, 1], proj[:, 0])
-    lo, hi = np.percentile(phi, [alpha * 100, (1 - alpha) * 100])
-    He = (
-        np.array(
-            [
-                np.cos([lo, hi]),
-                np.sin([lo, hi]),
-            ]
-        ).T
-        @ V.T
+def macenko_normalize(image: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Approximate Macenko stain normalization."""
+    img = image.astype(np.float32) + eps
+    log_rgb = np.log(img)
+    centered = log_rgb - log_rgb.mean(axis=(0, 1), keepdims=True)
+    u, _, vh = np.linalg.svd(centered.reshape(-1, 3), full_matrices=False)
+    stain_matrix = vh[:2, :]
+    concentrations = centered.reshape(-1, 3) @ stain_matrix.T
+    concentrations = (concentrations - concentrations.min()) / (
+        concentrations.max() - concentrations.min() + eps
     )
-    He = He / np.linalg.norm(He, axis=1, keepdims=True)
+    norm = concentrations @ stain_matrix
+    norm = np.exp(norm).reshape(image.shape)
+    norm = np.clip(norm, 0, 255).astype(np.uint8)
+    return norm
 
-    C = np.linalg.lstsq(He.T, _optical_density(img_rgb).reshape(-1, 3).T, rcond=None)[0]
-    if ref_he is None:
-        ref_means = np.percentile(C, 99, axis=1)
+
+def build_transforms(
+    mode: str, image_size: int, stain_normalization: bool
+) -> Tuple[transforms.Compose, transforms.Compose]:
+    """Factory of augmentation pipelines."""
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+    apply_stain = stain_normalization or mode == "strong"
+
+    def _stain(img):
+        if not apply_stain:
+            return img
+        arr = np.array(img)
+        arr = macenko_normalize(arr)
+        return transforms.functional.to_pil_image(arr)
+
+    if mode == "none":
+        train_ops = [transforms.Resize((image_size, image_size))]
     else:
-        ref_means = np.asarray(ref_he).reshape(-1)
-    Cn = C * (ref_means[:, None] / (np.percentile(C, 99, axis=1) + 1e-6)[:, None])
-    In = (Io * np.exp(-(He.T @ Cn).T)).reshape(img_rgb.shape).clip(0, 255)
-    return In.astype(np.uint8)
+        train_ops = [transforms.Resize((image_size, image_size))]
+        if mode in {"basic", "strong"}:
+            train_ops.extend(
+                [
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(),
+                    transforms.RandomRotation(90),
+                ]
+            )
+        if mode == "strong":
+            train_ops.extend(
+                [
+                    transforms.ColorJitter(0.3, 0.3, 0.3, 0.1),
+                    transforms.RandomApply(
+                        [transforms.GaussianBlur(kernel_size=3)], p=0.3
+                    ),
+                ]
+            )
+    train_ops.extend([transforms.ToTensor(), normalize])
+    eval_ops = [
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        normalize,
+    ]
+    train_tfm = transforms.Compose([transforms.Lambda(_stain), *train_ops])
+    eval_tfm = transforms.Compose([transforms.Lambda(_stain), *eval_ops])
+    return train_tfm, eval_tfm

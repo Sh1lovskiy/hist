@@ -1,48 +1,56 @@
-# models_gnn.py
+"""Graph neural network heads for patch-level graphs."""
 from __future__ import annotations
-import torch
-import torch.nn as nn
 
-try:
-    from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
-except Exception:
-    GCNConv = GATConv = global_mean_pool = None
+import torch
+from torch import nn
+
+try:  # pragma: no cover - optional dependency
+    from torch_geometric.nn import GATConv, GCNConv, global_mean_pool
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError("torch_geometric is required for graph models") from exc
 
 
 class GCNHead(nn.Module):
-    """Two-layer GCN + global mean pool → logits."""
+    """GCN for slide-level prediction."""
 
-    def __init__(self, d: int, n_cls: int, h: int = 256):
+    def __init__(self, in_dim: int, hidden_dim: int, n_classes: int) -> None:
         super().__init__()
-        if GCNConv is None:
-            raise RuntimeError("torch_geometric is required for GCNHead.")
-        self.g1 = GCNConv(d, h)
-        self.g2 = GCNConv(h, h)
-        self.cls = nn.Linear(h, n_cls)
+        self.conv1 = GCNConv(in_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.lin = nn.Linear(hidden_dim, n_classes)
 
-    def forward(self, data):
-        x = self.g1(data.x, data.edge_index).relu()
-        x = self.g2(x, data.edge_index).relu()
-        # single graph per slide: batch fake as zeros
-        b = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        z = global_mean_pool(x, b).unsqueeze(0)
-        return self.cls(z)
+    def forward(self, data) -> torch.Tensor:  # type: ignore[override]
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index).relu()
+        pooled = global_mean_pool(x, batch)
+        return self.lin(pooled)
 
 
 class GATHead(nn.Module):
-    """GAT(8 heads) + global pool → logits."""
+    """GAT for slide-level prediction."""
 
-    def __init__(self, d: int, n_cls: int, h: int = 256, heads: int = 4):
+    def __init__(self, in_dim: int, hidden_dim: int, n_classes: int, heads: int = 4) -> None:
         super().__init__()
-        if GATConv is None:
-            raise RuntimeError("torch_geometric is required for GATHead.")
-        self.g1 = GATConv(d, h, heads=heads, concat=True)
-        self.g2 = GATConv(h * heads, h, heads=1, concat=True)
-        self.cls = nn.Linear(h, n_cls)
+        self.conv1 = GATConv(in_dim, hidden_dim, heads=heads)
+        self.conv2 = GATConv(hidden_dim * heads, hidden_dim, heads=1)
+        self.lin = nn.Linear(hidden_dim, n_classes)
 
-    def forward(self, data):
-        x = self.g1(data.x, data.edge_index).relu()
-        x = self.g2(x, data.edge_index).relu()
-        b = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        z = global_mean_pool(x, b).unsqueeze(0)
-        return self.cls(z)
+    def forward(self, data) -> torch.Tensor:  # type: ignore[override]
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index).relu()
+        pooled = global_mean_pool(x, batch)
+        return self.lin(pooled)
+
+
+class HybridMILGraph(nn.Module):
+    """Combine MIL embedding with graph embedding."""
+
+    def __init__(self, mil_dim: int, gnn_dim: int, n_classes: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(mil_dim + gnn_dim, n_classes)
+
+    def forward(self, mil_emb: torch.Tensor, gnn_emb: torch.Tensor) -> torch.Tensor:
+        concat = torch.cat([mil_emb, gnn_emb], dim=-1)
+        return self.proj(concat)

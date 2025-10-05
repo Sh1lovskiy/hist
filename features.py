@@ -1,43 +1,67 @@
+"""Feature extraction utilities for WSI patches."""
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
 import torch
-import torch.nn as nn
-from torchvision import models, transforms
+from torch.amp import autocast
+from tqdm.auto import tqdm
+
+from data_wrappers import build_bags
 
 
-def build_train_transform(img_size: int) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+@dataclass
+class FeatureExtractionResult:
+    slide_ids: List[str]
+    features: List[torch.Tensor]
+    magnifications: List[int]
+    labels: List[int]
+    coords: List[torch.Tensor]
 
 
-def build_eval_transform(img_size: int) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+class FeatureExtractor:
+    """Run forward passes over patch dataset to produce features."""
 
+    def __init__(self, encoder: torch.nn.Module, device: torch.device, use_amp: bool) -> None:
+        self.encoder = encoder.to(device)
+        self.device = device
+        self.use_amp = use_amp
 
-class ResNet18Feats(nn.Module):
-    """Frozen ResNet-18 to 512-D features."""
+    def extract(self, dataloader) -> FeatureExtractionResult:
+        self.encoder.eval()
+        feats: List[torch.Tensor] = []
+        labels: List[int] = []
+        slide_ids: List[str] = []
+        magnifications: List[int] = []
+        coords: List[torch.Tensor] = []
+        progress = tqdm(dataloader, desc="feature", leave=False)
+        with torch.no_grad():
+            for images, targets, sids, mags, xy in progress:
+                images = images.to(self.device, non_blocking=True)
+                with autocast("cuda", enabled=self.use_amp):
+                    emb = self.encoder(images)
+                feats.extend(emb.detach().cpu())
+                labels.extend(targets.tolist())
+                slide_ids.extend(list(sids))
+                if isinstance(mags, torch.Tensor):
+                    magnifications.extend(mags.tolist())
+                else:
+                    magnifications.extend(list(mags))
+                coords.extend([xy_i.cpu() for xy_i in xy])
+        return FeatureExtractionResult(
+            slide_ids=slide_ids,
+            features=feats,
+            magnifications=magnifications,
+            labels=labels,
+            coords=coords,
+        )
 
-    def __init__(self):
-        super().__init__()
-        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        m.fc = nn.Identity()
-        for p in m.parameters():
-            p.requires_grad_(False)
-        self.backbone = m
-        self.out_dim = 512
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
+    def to_bags(self, result: FeatureExtractionResult):
+        return build_bags(
+            result.slide_ids,
+            result.features,
+            result.magnifications,
+            result.labels,
+            result.coords,
+        )

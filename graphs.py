@@ -1,68 +1,71 @@
-# graphs.py
+"""Graph construction utilities for patch-level features."""
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Tuple, Literal
+from typing import Literal
+
 import numpy as np
+import torch
 
-try:
-    import torch
-    from torch_geometric.data import Data
-except Exception:
-    torch, Data = None, None
+try:  # pragma: no cover - optional dependency
+    from sklearn.neighbors import NearestNeighbors
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError("scikit-learn is required for graph construction") from exc
 
-try:
+try:  # pragma: no cover
     from scipy.spatial import Delaunay
-except Exception:
+except ImportError:  # pragma: no cover
     Delaunay = None
 
-from loguru import logger
+from torch_geometric.data import Data
+
+from data_wrappers import Bag
 
 
-@dataclass(frozen=True)
-class GraphCfg:
-    kind: Literal["knn", "delaunay"] = "knn"
+@dataclass
+class GraphConfig:
+    mode: Literal["knn", "delaunay"] = "knn"
     k: int = 8
 
 
-def _knn_edges(XY: np.ndarray, k: int) -> np.ndarray:
-    from sklearn.neighbors import NearestNeighbors
+class GraphBuilder:
+    """Construct patch-level graphs from coordinates."""
 
-    nbrs = NearestNeighbors(n_neighbors=min(k + 1, len(XY))).fit(XY)
-    idx = nbrs.kneighbors(return_distance=False)[:, 1:]
-    src = np.repeat(np.arange(len(XY)), idx.shape[1])
-    dst = idx.reshape(-1)
-    return np.stack([src, dst], axis=0)
+    def __init__(self, cfg: GraphConfig) -> None:
+        self.cfg = cfg
 
+    def build(self, bag: Bag, magnification: int) -> Data:
+        feats = bag.features[magnification]
+        coords = bag.coords[magnification].float().cpu().numpy()
+        edges = self._edges(coords)
+        data = Data(x=feats, edge_index=edges, y=torch.tensor([bag.label]))
+        data.slide_id = bag.slide_id
+        data.magnification = magnification
+        return data
 
-def _delaunay_edges(XY: np.ndarray) -> np.ndarray:
-    if Delaunay is None:
-        logger.warning("Scipy missing, falling back to kNN(k=8).")
-        return _knn_edges(XY, 8)
-    tri = Delaunay(XY)
-    edges = set()
-    for simplex in tri.simplices:
-        a, b, c = simplex
-        edges.update(
-            {tuple(sorted((a, b))), tuple(sorted((b, c))), tuple(sorted((a, c)))}
-        )
-    e = np.array(list(edges)).T
-    return np.concatenate([e, e[::-1]], axis=1)  # undirected both ways
+    def _edges(self, coords: np.ndarray) -> torch.Tensor:
+        if self.cfg.mode == "knn":
+            return self._edges_knn(coords)
+        return self._edges_delaunay(coords)
 
+    def _edges_knn(self, coords: np.ndarray) -> torch.Tensor:
+        nbrs = NearestNeighbors(n_neighbors=min(self.cfg.k + 1, len(coords)))
+        nbrs.fit(coords)
+        indices = nbrs.kneighbors(return_distance=False)
+        src = np.repeat(np.arange(len(coords)), indices.shape[1] - 1)
+        dst = indices[:, 1:].reshape(-1)
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        return edge_index
 
-def build_graph(feats: np.ndarray, xy: np.ndarray, cfg: GraphCfg) -> "Data | dict":
-    """
-    Build a graph from patch embeddings and 2D coords.
-    Returns torch_geometric Data when PyG is installed, else a dict.
-    """
-    if cfg.kind == "knn":
-        edge_index = _knn_edges(xy, cfg.k)
-    else:
-        edge_index = _delaunay_edges(xy)
-
-    if torch is None or Data is None:
-        return {"x": feats, "edge_index": edge_index, "pos": xy}
-
-    x = torch.from_numpy(feats).float()
-    ei = torch.from_numpy(edge_index).long()
-    pos = torch.from_numpy(xy).float()
-    return Data(x=x, edge_index=ei, pos=pos)
+    def _edges_delaunay(self, coords: np.ndarray) -> torch.Tensor:
+        if Delaunay is None:
+            raise RuntimeError("scipy is required for Delaunay graphs")
+        tri = Delaunay(coords)
+        edges = set()
+        for simplex in tri.simplices:
+            for i in range(3):
+                a, b = simplex[i], simplex[(i + 1) % 3]
+                edges.add(tuple(sorted((a, b))))
+        src, dst = zip(*edges) if edges else ([], [])
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        return edge_index

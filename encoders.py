@@ -1,93 +1,108 @@
-# encoders.py
+"""Backbone factory for feature extraction."""
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Tuple
+
 import torch
-import torch.nn as nn
+from loguru import logger
 
-try:
+try:  # pragma: no cover - optional dependency
     import timm
-except Exception:
-    timm = None
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError("timm is required for encoder factory") from exc
 
-try:
+try:  # pragma: no cover
     import open_clip
-except Exception:
+except ImportError:  # pragma: no cover
     open_clip = None
 
 
-@dataclass(frozen=True)
-class EncCfg:
-    name: Literal["resnet18", "vit_b16", "convnext_t", "clip_vit_b32", "hipt"] = (
-        "resnet18"
-    )
+@dataclass
+class EncoderConfig:
+    name: str = "resnet18"
+    pretrained: bool = True
+    fine_tune: bool = False
+    drop_rate: float = 0.0
     img_size: int = 224
-    freeze: bool = True
 
 
-def _freeze(m: nn.Module) -> None:
-    for p in m.parameters():
-        p.requires_grad = False
+class Encoder(torch.nn.Module):
+    """Wrapper returning pooled features."""
 
-
-class Encoder(nn.Module):
-    """Feature extractor returning (feats, out_dim)."""
-
-    def __init__(self, cfg: EncCfg):
+    def __init__(self, backbone: torch.nn.Module, feat_dim: int, fine_tune: bool) -> None:
         super().__init__()
-        self.cfg = cfg
-        self.backbone, self.out_dim = self._build(cfg)
-        if cfg.freeze:
-            _freeze(self.backbone)
+        self.backbone = backbone
+        self.feat_dim = feat_dim
+        self.fine_tune = fine_tune
 
-    def _build(self, cfg: EncCfg) -> Tuple[nn.Module, int]:
-        if cfg.name in {"resnet18", "vit_b16", "convnext_t"}:
-            if timm is None:
-                raise RuntimeError("timm is required for this encoder.")
-            model = timm.create_model(
-                {
-                    "resnet18": "resnet18",
-                    "vit_b16": "vit_base_patch16_224",
-                    "convnext_t": "convnext_tiny",
-                }[cfg.name],
-                pretrained=True,
-                num_classes=0,
-            )
-            out_dim = model.num_features
-            return model, int(out_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        with torch.set_grad_enabled(self.fine_tune):
+            feats = self.backbone(x)
+        return feats
 
-        if cfg.name == "clip_vit_b32":
-            if open_clip is None:
-                raise RuntimeError("open_clip is required for CLIP encoder.")
-            model, _, _ = open_clip.create_model_and_transforms(
-                "ViT-B-32", pretrained="openai"
-            )
-            # Take visual trunk until pre-logit (global pooled)
-            visual = model.visual
-            out_dim = int(getattr(visual, "output_dim", 512))
 
-            class CLIPFeat(nn.Module):
-                def __init__(self, vis):
-                    super().__init__()
-                    self.vis = vis
+def build_encoder(cfg: EncoderConfig) -> Tuple[Encoder, int]:
+    """Instantiate encoder by name."""
+    aliases = {
+        "vit_b16": "vit_base_patch16_224",
+        "vit_b32": "vit_base_patch32_224",
+        "convnext_t": "convnext_tiny",
+        "convnext_base": "convnext_base",
+        "resnet18": "resnet18",
+        "resnet50": "resnet50",
+        "clip_vitb16": "ViT-B-16",
+    }
+    key = cfg.name.lower()
+    name = aliases.get(key, key)
+    if key.startswith("clip"):
+        return _build_clip(cfg)
+    if name == "hipt":
+        return _build_hipt(cfg)
+    extra = {}
+    if "vit" in name.lower():
+        extra["img_size"] = cfg.img_size
+    model = timm.create_model(
+        name,
+        pretrained=cfg.pretrained,
+        num_classes=0,
+        global_pool="avg",
+        drop_rate=cfg.drop_rate,
+        **extra,
+    )
+    feat_dim = model.num_features
+    encoder = Encoder(model, feat_dim, cfg.fine_tune)
+    if not cfg.fine_tune:
+        for param in encoder.parameters():
+            param.requires_grad = False
+    logger.info(f"Encoder {name} created (dim={feat_dim})")
+    return encoder, feat_dim
 
-                def forward(self, x):
-                    return self.vis(x)
 
-            return CLIPFeat(visual), out_dim
+def _build_clip(cfg: EncoderConfig) -> Tuple[Encoder, int]:
+    if open_clip is None:
+        raise RuntimeError("open_clip is required for CLIP encoders")
+    model, _, _ = open_clip.create_model_and_transforms(
+        "ViT-B-16", pretrained="openai"
+    )
+    encoder = Encoder(model.visual, model.visual.output_dim, cfg.fine_tune)
+    if not cfg.fine_tune:
+        for param in encoder.parameters():
+            param.requires_grad = False
+    return encoder, model.visual.output_dim
 
-        if cfg.name == "hipt":
-            # Minimal stub: expect an external HIPT extractor in future.
-            # For now, fallback to timm ViT-B/16 features to keep pipeline running.
-            if timm is None:
-                raise RuntimeError("timm is required for HIPT fallback.")
-            model = timm.create_model(
-                "vit_base_patch16_224", pretrained=True, num_classes=0
-            )
-            return model, int(model.num_features)
 
-        raise ValueError(f"Unknown encoder: {cfg.name}")
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
+def _build_hipt(cfg: EncoderConfig) -> Tuple[Encoder, int]:
+    """Placeholder HIPT encoder using ViT hierarchical token."""
+    model = timm.create_model(
+        "vit_base_patch16_224",
+        pretrained=cfg.pretrained,
+        num_classes=0,
+        global_pool="avg",
+    )
+    feat_dim = model.num_features
+    encoder = Encoder(model, feat_dim, cfg.fine_tune)
+    if not cfg.fine_tune:
+        for param in encoder.parameters():
+            param.requires_grad = False
+    return encoder, feat_dim
