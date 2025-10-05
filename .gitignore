@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+*.log
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & outputs
+data/
+outputs/
+logs/
+checkpoints/
+runs/
+experiments/
+
+# Images / figures
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Temporary files
+tmp/
+temp/
