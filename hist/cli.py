@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import List
 
 # стараемся не тянуть ничего тяжёлого на верхнем уровне
 # модуль логирования должен быть лёгким и без каскадных импортов
@@ -45,7 +44,6 @@ def _build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--encoder", type=str, default="vit_b16")
     extract_parser.add_argument("--device", type=str, default="cpu")
     extract_parser.add_argument("--batch-size", type=int, default=64)
-    extract_parser.add_argument("--num-workers", type=int, default=0)
 
     # ---- train ----
     train_parser = subparsers.add_parser("train", help="Train MIL models")
@@ -84,7 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: List[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
     configure_logging(level="DEBUG" if args.verbose else "INFO")

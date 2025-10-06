@@ -24,11 +24,15 @@ data/
 outputs/
 logs/
 checkpoints/
+!hist/data/
+!hist/data/**
 runs/
 experiments/
 debug_patches/
 saves/
 README.pdf
+last.patch
+
 # Images / figures
 *.png
 *.jpg
