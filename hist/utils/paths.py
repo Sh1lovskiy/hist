@@ -7,9 +7,16 @@ from pathlib import Path
 from typing import Optional
 
 
-def ensure_exists(path: Path, kind: str = "file") -> Path:
+def ensure_exists(path: Path, kind: str = "file", hint: str | None = None) -> Path:
+    """Validate that ``path`` exists and raise a helpful error otherwise."""
+
     if not path.exists():
-        raise FileNotFoundError(f"Expected {kind} at '{path}'")
+        message = f"Expected {kind} at '{path}'."
+        if hint:
+            message = f"{message} {hint}"
+        else:
+            message = f"{message} Create it or adjust the corresponding CLI flag."
+        raise FileNotFoundError(message)
     return path
 
 

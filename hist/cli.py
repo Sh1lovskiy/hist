@@ -31,8 +31,15 @@ def _build_parser() -> argparse.ArgumentParser:
     tile_parser.add_argument("--slides", type=Path, required=True)
     tile_parser.add_argument("--annos", type=Path, required=True)
     tile_parser.add_argument("--out", type=Path, required=True)
+    tile_parser.add_argument("--levels", type=int, nargs="+", default=[0])
     tile_parser.add_argument("--patch-size", type=int, default=224)
+    tile_parser.add_argument("--patch-size-per-level", type=int, nargs="+")
+    tile_parser.add_argument("--scale-per-level", type=float, nargs="+")
     tile_parser.add_argument("--stride", type=int, default=224)
+    tile_parser.add_argument("--stride-per-level", type=int, nargs="+")
+    tile_parser.add_argument("--label-overlap-threshold", type=float, default=0.5)
+    tile_parser.add_argument("--classes", nargs="+")
+    tile_parser.add_argument("--write-edges", action="store_true")
     tile_parser.add_argument("--overwrite", action="store_true")
 
     # ---- extract ----
@@ -89,15 +96,22 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "tile":
         # ЛЕНИВЫЙ импорт только здесь
-        from hist.tiling.tiler import TileRequest, tile_dataset
+        from hist.tiling.tiler import DEFAULT_CLASSES, TileRequest, tile_dataset
 
         request = TileRequest(
             slides_dir=args.slides,
             annotations_dir=args.annos,
             output_dir=args.out,
+            levels=tuple(args.levels),
             patch_size=args.patch_size,
+            patch_size_per_level=tuple(args.patch_size_per_level) if args.patch_size_per_level else None,
+            scale_per_level=tuple(args.scale_per_level) if args.scale_per_level else None,
             stride=args.stride,
+            stride_per_level=tuple(args.stride_per_level) if args.stride_per_level else None,
+            label_overlap_threshold=args.label_overlap_threshold,
             overwrite=args.overwrite,
+            classes=tuple(args.classes) if args.classes else DEFAULT_CLASSES,
+            write_edges=args.write_edges,
         )
         out_dir = tile_dataset(request)
         logger.info("Patch CSVs stored in %s", out_dir)
