@@ -28,7 +28,7 @@ runs/
 experiments/
 debug_patches/
 saves/
-
+README.pdf
 # Images / figures
 *.png
 *.jpg
