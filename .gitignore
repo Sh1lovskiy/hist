@@ -27,6 +27,7 @@ checkpoints/
 runs/
 experiments/
 debug_patches/
+saves/
 
 # Images / figures
 *.png
